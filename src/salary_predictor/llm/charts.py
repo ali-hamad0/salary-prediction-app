@@ -55,6 +55,21 @@ REFERENCE_AVERAGES = {
     "EX": 165000,
 }
 
+REMOTE_ORDER = [0, 50, 100]
+
+REMOTE_LABELS = {
+    0:   "On-site",
+    50:  "Hybrid",
+    100: "Fully Remote",
+}
+
+# Fallback reference averages by remote ratio from training data.
+REMOTE_REFERENCE_AVERAGES = {
+    0:   105000,
+    50:  115000,
+    100: 125000,
+}
+
 
 def _compute_averages(df: pd.DataFrame) -> dict:
     """
@@ -215,5 +230,105 @@ def make_prediction_chart(
     logger.info(
         "Chart generated for %s / %s — source: %s",
         title, experience, subtitle,
+    )
+    return chart_base64
+
+
+def make_remote_chart(
+    inputs: dict,
+    predicted_salary: float,
+    df: pd.DataFrame | None = None,
+) -> str:
+    """
+    Horizontal bar chart comparing average salary by remote ratio
+    (On-site / Hybrid / Fully Remote) for this job title.
+
+    Uses real Supabase data when >= 5 rows exist for the job title.
+    Falls back to reference averages otherwise.
+
+    The bar matching this prediction's remote_ratio is highlighted in blue.
+    A dashed red line marks this prediction's salary.
+
+    Args:
+        inputs:           dict of user inputs (remote_ratio, job_title, etc.)
+        predicted_salary: the salary predicted by the model
+        df:               optional DataFrame from Supabase
+
+    Returns:
+        base64-encoded PNG string
+    """
+    remote_ratio = inputs["remote_ratio"]
+    title        = inputs["job_title"]
+
+    # Resolve chart data — real if enough rows, reference otherwise
+    if df is not None and not df.empty:
+        title_df = df[df["job_title"] == title]
+        source_df = title_df if len(title_df) >= 5 else df
+        subtitle = f"Real data — {title}" if len(title_df) >= 5 else "All job titles"
+
+        averages = {}
+        for ratio in REMOTE_ORDER:
+            subset = source_df[source_df["remote_ratio"] == ratio]["predicted_salary_usd"]
+            averages[ratio] = float(subset.mean()) if not subset.empty else REMOTE_REFERENCE_AVERAGES[ratio]
+    else:
+        averages = dict(REMOTE_REFERENCE_AVERAGES)
+        subtitle = "Market reference averages"
+
+    labels  = [REMOTE_LABELS[r] for r in REMOTE_ORDER]
+    heights = [averages[r] for r in REMOTE_ORDER]
+    colors  = [
+        "#1F77B4" if r == remote_ratio else "#C8D8E8"
+        for r in REMOTE_ORDER
+    ]
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    fig.patch.set_facecolor("white")
+
+    bars = ax.barh(labels, heights, color=colors, edgecolor="white", linewidth=0.8)
+
+    # Label at end of each bar
+    for bar, val in zip(bars, heights):
+        ax.text(
+            val + 500,
+            bar.get_y() + bar.get_height() / 2,
+            f"${val:,.0f}",
+            va="center", ha="left",
+            fontsize=10, color="#444444",
+        )
+
+    # Dashed line — this prediction's salary
+    ax.axvline(
+        x=predicted_salary,
+        color="#DD4444",
+        linestyle="--",
+        linewidth=1.8,
+        label=f"This prediction: ${predicted_salary:,.0f}",
+    )
+
+    ax.set_title(
+        f"Salary by Work Arrangement\n{subtitle}",
+        fontsize=13, fontweight="bold", pad=14,
+    )
+    ax.set_xlabel("Annual Salary (USD)", fontsize=11)
+    ax.xaxis.set_major_formatter(
+        mticker.FuncFormatter(lambda x, _: f"${x/1000:.0f}k")
+    )
+    max_val = max(max(heights), predicted_salary)
+    ax.set_xlim(0, max_val * 1.3)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(fontsize=10)
+
+    plt.tight_layout()
+
+    buffer = BytesIO()
+    plt.savefig(buffer, format="png", dpi=150, bbox_inches="tight")
+    plt.close()
+    buffer.seek(0)
+
+    chart_base64 = base64.b64encode(buffer.read()).decode("utf-8")
+    logger.info(
+        "Remote chart generated for %s / remote=%s — source: %s",
+        title, remote_ratio, subtitle,
     )
     return chart_base64

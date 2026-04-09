@@ -3,6 +3,6 @@
 __pycache__/
 *.pyc
 .venv/
-models/*.pkl
+# models/*.pkl  — committed so deployment platforms have the trained model
 data/raw/
 *.log
