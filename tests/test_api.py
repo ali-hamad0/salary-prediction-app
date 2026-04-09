@@ -141,40 +141,10 @@ def test_predict_returns_500_on_unexpected_error() -> None:
     assert "unexpected internal failure" not in response.json()["detail"]
 
 
-# ── /valid-values ──────────────────────────────────────────────────────
-
-def test_valid_values_returns_three_keys() -> None:
-    """/valid-values always returns job_title, employee_residence, company_location."""
-    # Arrange
-    mock_values = ["Data Scientist", "Data Engineer"]
-
-    with patch(
-        "salary_predictor.api.predict.get_valid_values",
-        return_value=mock_values,
-    ):
-        # Act
-        response = client.get("/valid-values")
+def test_unknown_route_returns_404() -> None:
+    """Any route not defined in the API returns 404."""
+    # Act
+    response = client.get("/valid-values")
 
     # Assert
-    assert response.status_code == 200
-    data = response.json()
-    assert "job_title" in data
-    assert "employee_residence" in data
-    assert "company_location" in data
-
-
-def test_valid_values_returns_lists_not_empty() -> None:
-    """Each field in /valid-values is a non-empty list."""
-    # Arrange
-    with patch(
-        "salary_predictor.api.predict.get_valid_values",
-        return_value=["Data Scientist", "Data Engineer"],
-    ):
-        # Act
-        response = client.get("/valid-values")
-
-    # Assert
-    data = response.json()
-    for key in ("job_title", "employee_residence", "company_location"):
-        assert isinstance(data[key], list)
-        assert len(data[key]) > 0
+    assert response.status_code == 404

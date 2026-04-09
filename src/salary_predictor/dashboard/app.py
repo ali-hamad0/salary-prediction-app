@@ -169,18 +169,22 @@ def load_all_predictions() -> pd.DataFrame:
 
 @st.cache_data(ttl=3600)
 def fetch_valid_values() -> dict:
-    try:
-        response = requests.get(f"{API_BASE_URL}/valid-values", timeout=10)
-        response.raise_for_status()
-        return response.json()
-    except Exception:
-        return {
-            "job_title":          ["Data Scientist", "Data Engineer",
-                                   "Data Analyst", "Machine Learning Engineer",
-                                   "Research Scientist"],
-            "employee_residence": ["US", "GB", "IN", "DE", "CA"],
-            "company_location":   ["US", "GB", "IN", "DE", "CA"],
-        }
+    """
+    Load valid categorical values directly from the trained model encoders.
+
+    The API only exposes /health and /predict — valid values come from
+    the model package which is installed alongside the dashboard.
+    """
+    from salary_predictor.model import get_valid_values, load_model, is_model_loaded
+
+    if not is_model_loaded():
+        load_model()
+
+    return {
+        "job_title":          get_valid_values("job_title"),
+        "employee_residence": get_valid_values("employee_residence"),
+        "company_location":   get_valid_values("company_location"),
+    }
 
 
 # ── Sidebar — form inputs ──────────────────────────────────────

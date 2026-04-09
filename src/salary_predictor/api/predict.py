@@ -8,7 +8,7 @@ import logging
 from fastapi import APIRouter, HTTPException
 
 from salary_predictor.api.schemas import PredictionRequest, PredictionResponse
-from salary_predictor.model import predict_salary, get_valid_values, is_model_loaded
+from salary_predictor.model import predict_salary, is_model_loaded
 
 logger = logging.getLogger(__name__)
 
@@ -76,25 +76,3 @@ def predict(
         inputs=inputs,
     )
 
-@router.get("/debug")
-def debug() -> dict:
-    """Temporary endpoint — shows what features the model expects."""
-    from salary_predictor.model import _metadata, _encoders
-    return {
-        "feature_names": _metadata.get("feature_names", []),
-        "encoded_columns": list(_encoders.keys()),
-    }
-
-@router.get("/valid-values")
-def valid_values() -> dict:
-    """
-    Return all accepted values for the free-text fields.
-
-    Call this first to know which job_title, employee_residence,
-    and company_location values the model will accept.
-    """
-    return {
-        "job_title":          get_valid_values("job_title"),
-        "employee_residence": get_valid_values("employee_residence"),
-        "company_location":   get_valid_values("company_location"),
-    }
