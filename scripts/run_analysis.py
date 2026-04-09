@@ -4,14 +4,13 @@
 #   1. Calls run_pipeline() to get predictions from the API
 #   2. Sends predictions to Ollama for narrative generation
 #   3. Generates a salary chart
-#   4. Prints results so we can verify before Phase 6
-#
-# Phase 6 will add Supabase saving to this same flow.
+#   4. Saves everything to Supabase
 
 import importlib.util
 import logging
 import os
 import sys
+import uuid
 
 from dotenv import load_dotenv
 
@@ -43,10 +42,11 @@ def load_run_pipeline():
 
 
 def main() -> None:
-    """Run predictions → LLM analysis → chart generation."""
+    """Run predictions → LLM analysis → chart → Supabase."""
 
     from salary_predictor.llm.analyst import get_narrative
     from salary_predictor.llm.charts import make_experience_chart
+    from salary_predictor.db.persist import save_predictions, save_analysis
 
     # Step 1 — get predictions from the API
     logger.info("Step 1 — running prediction pipeline...")
@@ -69,7 +69,7 @@ def main() -> None:
     logger.info("Step 3 — generating chart...")
     chart_base64 = make_experience_chart(stats)
 
-    # Step 4 — print everything so we can verify
+    # Step 4 — print so we can verify
     logger.info("=" * 50)
     logger.info("Analysis complete")
     logger.info("=" * 50)
@@ -86,9 +86,21 @@ def main() -> None:
     print(f"  Base64 length     : {len(chart_base64)} characters")
     print(f"  First 60 chars    : {chart_base64[:60]}...")
 
-    print("\nPhase 5 complete. Ready for Phase 6 — Supabase persistence.")
+    # Step 5 — save to Supabase
+    logger.info("Step 5 — saving to Supabase...")
 
-    return predictions, narrative, stats, chart_base64
+    # One run_id links all predictions to their analysis
+    run_id = str(uuid.uuid4())
+    logger.info("Run ID: %s", run_id)
+
+    rows_saved     = save_predictions(predictions, run_id)
+    analysis_saved = save_analysis(run_id, narrative, chart_base64, stats)
+
+    print(f"\n--- SUPABASE ---")
+    print(f"  Run ID           : {run_id}")
+    print(f"  Predictions saved: {rows_saved}")
+    print(f"  Analysis saved   : {analysis_saved}")
+    print("\nPhase 6 complete. Ready for Phase 7 — Streamlit dashboard.")
 
 
 if __name__ == "__main__":
