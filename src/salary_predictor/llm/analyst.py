@@ -1,14 +1,21 @@
 # src/salary_predictor/llm/analyst.py
 #
-# Computes salary stats from predictions and sends them
-# to Ollama to generate a written narrative.
+# Sends ONE prediction's inputs + salary to Ollama
+# and returns a context-aware narrative.
 #
-# We compute the stats first and put real numbers in the prompt.
-# This is the difference between a useful narrative and generic filler.
+# The prompt changes based on the actual inputs —
+# experience level, job title, company size, salary.
+# This makes every narrative unique to that prediction.
+#
+# When a Supabase DataFrame is provided, we compute the real
+# market average for that job title + experience level and
+# inject the comparison (above/below by X%) directly into the
+# prompt so the LLM never has to guess.
 
 import logging
 import os
 
+import pandas as pd
 import requests
 from dotenv import load_dotenv
 
@@ -19,165 +26,180 @@ logger = logging.getLogger(__name__)
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "llama3.1:latest")
 
+# Human-readable labels for the coded values
+EXPERIENCE_LABELS = {
+    "EN": "Entry-level",
+    "MI": "Mid-level",
+    "SE": "Senior",
+    "EX": "Executive",
+}
+EMPLOYMENT_LABELS = {
+    "FT": "Full-time",
+    "PT": "Part-time",
+    "CT": "Contract",
+    "FL": "Freelance",
+}
+SIZE_LABELS = {
+    "S": "Small",
+    "M": "Medium",
+    "L": "Large",
+}
+REMOTE_LABELS = {
+    0:   "fully on-site",
+    50:  "hybrid",
+    100: "fully remote",
+}
 
-def compute_stats(predictions: list) -> dict:
+
+def _market_comparison(
+    inputs: dict,
+    predicted_salary: float,
+    df: pd.DataFrame | None,
+) -> str:
     """
-    Compute summary statistics from the prediction results.
+    Compute how this prediction compares to the real market average
+    from Supabase data. Returns a plain-English sentence to inject
+    into the LLM prompt.
+
+    We look for rows matching the same job_title + experience_level.
+    If there are fewer than 5, we widen to just experience_level.
+    If still fewer than 5, we return a neutral fallback string.
 
     Args:
-        predictions: list of dicts from run_pipeline()
+        inputs:           user inputs dict
+        predicted_salary: the salary predicted by the model
+        df:               optional Supabase predictions DataFrame
 
     Returns:
-        dict of grouped salary averages and overall stats
+        comparison string, e.g. "above the market average by 12%"
     """
-    # Group salaries by experience level
-    by_experience = {}
-    for item in predictions:
-        level = item["experience_level"]
-        if level not in by_experience:
-            by_experience[level] = []
-        by_experience[level].append(item["predicted_salary_usd"])
+    if df is None or df.empty:
+        return "within the expected range for this role"
 
-    # Group salaries by job title
-    by_title = {}
-    for item in predictions:
-        title = item["job_title"]
-        if title not in by_title:
-            by_title[title] = []
-        by_title[title].append(item["predicted_salary_usd"])
+    title      = inputs["job_title"]
+    experience = inputs["experience_level"]
 
-    # Group salaries by remote ratio
-    by_remote = {}
-    for item in predictions:
-        remote = item["remote_ratio"]
-        if remote not in by_remote:
-            by_remote[remote] = []
-        by_remote[remote].append(item["predicted_salary_usd"])
+    # Try narrow slice first: same title + same experience level
+    narrow = df[
+        (df["job_title"] == title) &
+        (df["experience_level"] == experience)
+    ]["predicted_salary_usd"]
 
-    # Group salaries by company size
-    by_size = {}
-    for item in predictions:
-        size = item["company_size"]
-        if size not in by_size:
-            by_size[size] = []
-        by_size[size].append(item["predicted_salary_usd"])
+    # Widen to just experience level if not enough data
+    if len(narrow) < 5:
+        narrow = df[
+            df["experience_level"] == experience
+        ]["predicted_salary_usd"]
 
-    # Compute mean salary for each group
-    def mean(values):
-        return round(sum(values) / len(values), 2)
+    if len(narrow) < 5:
+        return "within the expected range for this role"
 
-    all_salaries = [item["predicted_salary_usd"] for item in predictions]
+    market_avg = float(narrow.mean())
+    diff_pct   = ((predicted_salary - market_avg) / market_avg) * 100
 
-    return {
-        "total_predictions": len(predictions),
-        "overall_mean":      round(mean(all_salaries), 2),
-        "overall_min":       round(min(all_salaries), 2),
-        "overall_max":       round(max(all_salaries), 2),
-        "by_experience":     {k: mean(v) for k, v in by_experience.items()},
-        "by_job_title":      {k: mean(v) for k, v in by_title.items()},
-        "by_remote_ratio":   {k: mean(v) for k, v in by_remote.items()},
-        "by_company_size":   {k: mean(v) for k, v in by_size.items()},
-    }
+    if abs(diff_pct) < 3:
+        return f"right at the market average of ${market_avg:,.0f}"
+    elif diff_pct > 0:
+        return f"above the market average of ${market_avg:,.0f} by {diff_pct:.0f}%"
+    else:
+        return f"below the market average of ${market_avg:,.0f} by {abs(diff_pct):.0f}%"
 
 
-def build_prompt(stats: dict) -> str:
+def build_prompt(
+    inputs: dict,
+    predicted_salary: float,
+    market_context: str,
+) -> str:
     """
-    Build the prompt with real numbers from the stats.
+    Build a context-aware prompt using the actual prediction inputs
+    and a pre-computed market comparison string.
 
-    Giving the LLM exact dollar figures prevents it from
-    making up numbers or writing vague generic sentences.
+    Every field from the user's input is included so the LLM
+    can write a narrative specific to this exact scenario.
 
     Args:
-        stats: dict from compute_stats()
+        inputs:           dict of user inputs (experience, title, etc.)
+        predicted_salary: the salary the model predicted
+        market_context:   plain-English comparison vs. real market average
 
     Returns:
-        full prompt string to send to Ollama
+        prompt string to send to Ollama
     """
-    exp_labels  = {"EN": "Entry", "MI": "Mid", "SE": "Senior", "EX": "Executive"}
-    size_labels = {"S": "Small", "M": "Medium", "L": "Large"}
-    remote_labels = {0: "On-site", 50: "Hybrid", 100: "Fully remote"}
+    experience = EXPERIENCE_LABELS.get(inputs["experience_level"], inputs["experience_level"])
+    employment = EMPLOYMENT_LABELS.get(inputs["employment_type"], inputs["employment_type"])
+    size       = SIZE_LABELS.get(inputs["company_size"], inputs["company_size"])
+    remote     = REMOTE_LABELS.get(inputs["remote_ratio"], f"{inputs['remote_ratio']}% remote")
+    title      = inputs["job_title"]
+    salary     = f"${predicted_salary:,.0f}"
 
-    # Format each group as readable lines
-    exp_lines = "\n".join(
-        f"  - {exp_labels.get(k, k)}: ${v:,.0f}"
-        for k, v in sorted(stats["by_experience"].items())
-    )
-    title_lines = "\n".join(
-        f"  - {k}: ${v:,.0f}"
-        for k, v in sorted(
-            stats["by_job_title"].items(),
-            key=lambda x: x[1],
-            reverse=True,
-        )
-    )
-    remote_lines = "\n".join(
-        f"  - {remote_labels.get(k, k)}: ${v:,.0f}"
-        for k, v in sorted(stats["by_remote_ratio"].items())
-    )
-    size_lines = "\n".join(
-        f"  - {size_labels.get(k, k)}: ${v:,.0f}"
-        for k, v in sorted(stats["by_company_size"].items())
-    )
+    return f"""You are a senior career strategist writing a salary intelligence report for a data science professional.
 
-    return f"""You are a data analyst writing a salary insights report.
+PREDICTION DATA:
+- Role            : {title}
+- Experience      : {experience}
+- Employment      : {employment}
+- Company size    : {size}
+- Work arrangement: {remote}
+- Predicted salary: {salary} per year
+- Market position : {market_context}
 
-Use ONLY the numbers below. Do not invent any figures.
+Write exactly 3 paragraphs. No bullet points. No headers. No filler phrases like "In conclusion" or "It is worth noting".
 
-=== DATA ===
-Total predictions: {stats["total_predictions"]}
-Salary range: ${stats["overall_min"]:,.0f} to ${stats["overall_max"]:,.0f}
-Overall average: ${stats["overall_mean"]:,.0f}
+Paragraph 1 — THE SALARY IN CONTEXT:
+Open with a strong, specific sentence that anchors the salary to reality for this exact role and level.
+State that this salary is {market_context} — treat this as fact, not speculation.
+Explain what {salary} per year actually means at the {experience} stage of a {title}'s career —
+is this a comfortable starting point, a competitive offer, or a ceiling they need to break through?
+Make the reader feel the weight of the number.
 
-By experience level:
-{exp_lines}
+Paragraph 2 — WHAT IS DRIVING THIS NUMBER:
+Identify the two most influential factors shaping this salary from the inputs provided.
+Do not list them — weave them into a connected explanation.
+Be specific: "{size} companies" behave differently from large ones in how they price talent.
+"{remote}" roles carry different market dynamics than on-site positions.
+"{employment}" status affects total compensation beyond base salary.
+Explain the cause-and-effect — why do these factors push the salary in the direction they do?
 
-By job title (highest to lowest):
-{title_lines}
+Paragraph 3 — THE MOVE THAT CHANGES EVERYTHING:
+Give one strategic, high-leverage move this specific professional can make to meaningfully grow their salary.
+Not generic advice. Think about the combination of their level ({experience}), their setup ({size} company, {remote}),
+and their role ({title}).
+What is the single lever that would move their number the most — a transition, a negotiation angle, a skill bet?
+Make the advice feel urgent and actionable, not theoretical.
 
-By remote work type:
-{remote_lines}
-
-By company size:
-{size_lines}
-
-=== INSTRUCTIONS ===
-Write exactly 3 paragraphs. No bullet points. No title or heading.
-
-Paragraph 1 — FINDING: The single most important pattern in the data.
-Use specific dollar figures. Start with "The data reveals..."
-
-Paragraph 2 — EXPLANATION: Why this pattern likely exists.
-Connect it to how the job market actually works.
-
-Paragraph 3 — IMPLICATION: What this means for a data science professional.
-Give one concrete actionable recommendation.
-Start with "For data science professionals..."
-
-Total length: 150 to 200 words. Professional but conversational tone."""
+Write in a confident, direct voice. No hedging. Each paragraph should feel like it was written specifically for this person."""
 
 
-def get_narrative(predictions: list) -> dict:
+def get_narrative(
+    inputs: dict,
+    predicted_salary: float,
+    df: pd.DataFrame | None = None,
+) -> str:
     """
-    Compute stats and call Ollama to generate a narrative.
+    Call Ollama and return a narrative for one prediction.
 
     Args:
-        predictions: list of dicts from run_pipeline()
+        inputs:           dict of user inputs from the dashboard form
+        predicted_salary: the salary predicted by the model
+        df:               optional Supabase DataFrame used to compute
+                          real market comparison numbers
 
     Returns:
-        dict with keys: narrative (str), stats (dict)
+        narrative string from Ollama
 
     Raises:
         RuntimeError: if Ollama is unreachable or returns empty
     """
-    # Step 1 — compute stats
-    stats = compute_stats(predictions)
-    logger.info("Stats computed from %d predictions", len(predictions))
+    market_context = _market_comparison(inputs, predicted_salary, df)
+    prompt         = build_prompt(inputs, predicted_salary, market_context)
 
-    # Step 2 — build prompt with real numbers
-    prompt = build_prompt(stats)
-
-    # Step 3 — call Ollama
-    logger.info("Calling Ollama (%s) — this takes ~30 seconds...", OLLAMA_MODEL)
+    logger.info(
+        "Calling Ollama for %s / %s — predicted $%,.0f — %s",
+        inputs.get("job_title"),
+        inputs.get("experience_level"),
+        predicted_salary,
+        market_context,
+    )
 
     try:
         response = requests.post(
@@ -194,13 +216,10 @@ def get_narrative(predictions: list) -> dict:
     except requests.exceptions.ConnectionError:
         raise RuntimeError(
             f"Cannot connect to Ollama at {OLLAMA_BASE_URL}. "
-            "Is Ollama running? Try: ollama serve"
+            "Make sure Ollama is running: ollama serve"
         )
     except requests.exceptions.Timeout:
-        raise RuntimeError(
-            "Ollama took too long to respond. "
-            "Try again or check your machine resources."
-        )
+        raise RuntimeError("Ollama took too long. Try again.")
     except requests.exceptions.RequestException as error:
         raise RuntimeError(f"Ollama request failed: {error}") from error
 
@@ -210,8 +229,4 @@ def get_narrative(predictions: list) -> dict:
         raise RuntimeError("Ollama returned an empty response.")
 
     logger.info("Narrative generated — %d characters", len(narrative))
-
-    return {
-        "narrative": narrative,
-        "stats":     stats,
-    }
+    return narrative
