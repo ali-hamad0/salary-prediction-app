@@ -112,7 +112,7 @@ def call_predict_api(inputs: dict) -> float | None:
         response = requests.get(
             f"{API_BASE_URL}/predict",
             params=inputs,
-            timeout=15,
+            timeout=60,  # Render free tier cold start can take up to 60s
         )
         response.raise_for_status()
         return response.json()["predicted_salary_usd"]
@@ -292,7 +292,7 @@ def main() -> None:
         if predict_clicked:
 
             # Step 1 — call the API
-            with st.spinner("Predicting salary..."):
+            with st.spinner("Predicting salary — first request may take up to 60s to wake the API..."):
                 salary = call_predict_api(inputs)
 
             if salary is None:
